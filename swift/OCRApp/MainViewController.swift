@@ -431,4 +431,11 @@ extension MainViewController: DragDropViewDelegate {
     func dragDropView(_ view: DragDropView, didReceiveImage image: NSImage) {
         processImage(image: image)
     }
+
+    func dragDropView(_ view: DragDropView, didRejectDropWithError error: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.showAlert(title: "Drop Rejected", message: error)
+            self?.setStatus("Drop rejected: \(error)")
+        }
+    }
 }

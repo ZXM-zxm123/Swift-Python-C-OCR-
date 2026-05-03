@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <numeric>
 
 namespace imageproc {
 
@@ -120,25 +121,149 @@ bool ImageProcessor::saveToFile(const ImageData& image, const std::string& filep
     return file.good();
 }
 
+static double calculateVariance(const std::vector<unsigned char>& data) {
+    if (data.empty()) return 0.0;
+
+    double sum = 0.0;
+    double sumSq = 0.0;
+
+    for (size_t i = 0; i < data.size(); i++) {
+        double val = static_cast<double>(data[i]);
+        sum += val;
+        sumSq += val * val;
+    }
+
+    size_t n = data.size();
+    double mean = sum / n;
+    double variance = (sumSq / n) - (mean * mean);
+
+    return variance;
+}
+
+static bool isAlreadyBinarized(const std::vector<unsigned char>& data) {
+    if (data.empty()) return false;
+
+    int uniqueValues = 0;
+    bool hasZero = false;
+    bool has255 = false;
+
+    for (size_t i = 0; i < data.size(); i++) {
+        unsigned char val = data[i];
+        if (val == 0) {
+            hasZero = true;
+        } else if (val == 255) {
+            has255 = true;
+        } else {
+            return false;
+        }
+    }
+
+    return hasZero && has255;
+}
+
+static double calculateMean(const std::vector<unsigned char>& data) {
+    if (data.empty()) return 0.0;
+
+    double sum = 0.0;
+    for (size_t i = 0; i < data.size(); i++) {
+        sum += static_cast<double>(data[i]);
+    }
+    return sum / data.size();
+}
+
+static int calculateOtsuThreshold(const std::vector<unsigned char>& data) {
+    if (data.empty()) return 128;
+
+    int histogram[256] = {0};
+    for (size_t i = 0; i < data.size(); i++) {
+        histogram[data[i]]++;
+    }
+
+    size_t total = data.size();
+    double sum = 0.0;
+    for (int i = 0; i < 256; i++) {
+        sum += i * histogram[i];
+    }
+
+    double sumB = 0.0;
+    int wB = 0;
+    double maxVariance = 0.0;
+    int threshold = 128;
+
+    for (int t = 0; t < 256; t++) {
+        wB += histogram[t];
+        if (wB == 0) continue;
+
+        int wF = static_cast<int>(total) - wB;
+        if (wF == 0) break;
+
+        sumB += t * histogram[t];
+        double mB = sumB / wB;
+        double mF = (sum - sumB) / wF;
+        double variance = wB * wF * (mB - mF) * (mB - mF);
+
+        if (variance > maxVariance) {
+            maxVariance = variance;
+            threshold = t;
+        }
+    }
+
+    return threshold;
+}
+
+static int calculateAdaptiveThreshold(const std::vector<unsigned char>& data, int width, int height, int blockSize) {
+    if (data.empty() || width <= 0 || height <= 0) return 128;
+
+    double globalMean = calculateMean(data);
+
+    double localSum = 0.0;
+    int count = 0;
+
+    int half = blockSize / 2;
+    for (int y = half; y < height - half; y++) {
+        for (int x = half; x < width - half; x++) {
+            localSum += data[y * width + x];
+            count++;
+        }
+    }
+
+    double localMean = (count > 0) ? (localSum / count) : globalMean;
+
+    double alpha = 0.15;
+    return static_cast<int>(alpha * localMean + (1 - alpha) * globalMean);
+}
+
 ImageData ImageProcessor::toGrayscale(const ImageData& input) {
     ImageData output;
     output.width = input.width;
     output.height = input.height;
     output.channels = 1;
 
-    size_t inputChannels = input.channels;
+    if (input.data.empty() || input.width <= 0 || input.height <= 0) {
+        return output;
+    }
+
+    if (input.channels == 1) {
+        output.data = input.data;
+        return output;
+    }
+
     output.data.resize(input.width * input.height);
 
+    size_t inputChannels = input.channels;
     for (int y = 0; y < input.height; y++) {
         for (int x = 0; x < input.width; x++) {
             size_t inputIdx = (y * input.width + x) * inputChannels;
             size_t outputIdx = y * input.width + x;
 
             if (inputChannels >= 3) {
-                unsigned char r = input.data[inputIdx];
-                unsigned char g = input.data[inputIdx + 1];
-                unsigned char b = input.data[inputIdx + 2];
-                output.data[outputIdx] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b);
+                int r = static_cast<int>(input.data[inputIdx]);
+                int g = static_cast<int>(input.data[inputIdx + 1]);
+                int b = static_cast<int>(input.data[inputIdx + 2]);
+
+                int gray = (r * 299 + g * 587 + b * 114 + 500) / 1000;
+                gray = std::max(0, std::min(255, gray));
+                output.data[outputIdx] = static_cast<unsigned char>(gray);
             } else {
                 output.data[outputIdx] = input.data[inputIdx];
             }
@@ -153,10 +278,29 @@ ImageData ImageProcessor::binarize(const ImageData& input, int threshold) {
     output.width = input.width;
     output.height = input.height;
     output.channels = 1;
-    output.data.resize(input.width * input.height);
 
+    if (input.data.empty()) {
+        return output;
+    }
+
+    if (isAlreadyBinarized(input.data)) {
+        output.data = input.data;
+        return output;
+    }
+
+    double variance = calculateVariance(input.data);
+    if (variance < 100) {
+        output.data = input.data;
+        return output;
+    }
+
+    int adaptiveThreshold = calculateAdaptiveThreshold(input.data, input.width, input.height, 11);
+
+    int useThreshold = (threshold <= 0 || threshold >= 255) ? adaptiveThreshold : threshold;
+
+    output.data.resize(input.width * input.height);
     for (size_t i = 0; i < input.data.size(); i++) {
-        output.data[i] = input.data[i] > threshold ? 255 : 0;
+        output.data[i] = input.data[i] > useThreshold ? 255 : 0;
     }
 
     return output;
@@ -167,40 +311,56 @@ ImageData ImageProcessor::denoise(const ImageData& input, int kernelSize) {
     output.width = input.width;
     output.height = input.height;
     output.channels = input.channels;
-    output.data = input.data;
 
-    int half = kernelSize / 2;
-    std::vector<unsigned char> result = input.data;
+    if (input.data.empty() || kernelSize < 3) {
+        output.data = input.data;
+        return output;
+    }
 
-    for (int y = half; y < input.height - half; y++) {
-        for (int x = half; x < input.width - half; x++) {
-            int sum = 0;
-            int count = 0;
+    output.data.resize(input.width * input.height);
 
-            for (int ky = -half; ky <= half; ky++) {
-                for (int kx = -half; kx <= half; kx++) {
-                    int ny = y + ky;
-                    int nx = x + kx;
-                    if (ny >= 0 && ny < input.height && nx >= 0 && nx < input.width) {
+    if (input.channels == 1) {
+        int half = kernelSize / 2;
+
+        for (int y = 0; y < input.height; y++) {
+            for (int x = 0; x < input.width; x++) {
+                int sum = 0;
+                int count = 0;
+
+                for (int ky = -half; ky <= half; ky++) {
+                    for (int kx = -half; kx <= half; kx++) {
+                        int ny = std::max(0, std::min(input.height - 1, y + ky));
+                        int nx = std::max(0, std::min(input.width - 1, x + kx));
                         sum += input.data[ny * input.width + nx];
                         count++;
                     }
                 }
-            }
 
-            int avg = sum / count;
-            result[y * input.width + x] = static_cast<unsigned char>(avg);
+                output.data[y * input.width + x] = static_cast<unsigned char>(sum / count);
+            }
         }
+    } else {
+        output.data = input.data;
     }
 
-    output.data = result;
     return output;
 }
 
 ImageData ImageProcessor::preprocess(const ImageData& input, int threshold, int kernelSize) {
+    if (input.data.empty() || input.width <= 0 || input.height <= 0) {
+        return input;
+    }
+
     ImageData grayscale = toGrayscale(input);
+
+    if (grayscale.data.empty()) {
+        return input;
+    }
+
     ImageData denoised = denoise(grayscale, kernelSize);
+
     ImageData binarized = binarize(denoised, threshold);
+
     return binarized;
 }
 
